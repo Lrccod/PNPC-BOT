@@ -9,6 +9,8 @@ from datetime import datetime as dt, timedelta
 from collections import defaultdict
 from dotenv import load_dotenv
 import os
+from keep_alive import keep_alive
+keep_alive()
 # ================= CONFIG =================
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
@@ -561,5 +563,6 @@ bot.tree.add_command(tempban, guild=guild_obj)
 bot.tree.add_command(staffstats, guild=guild_obj)
 
 # ==========================================
+
 
 bot.run(TOKEN)
