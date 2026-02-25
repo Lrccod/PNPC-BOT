@@ -8,13 +8,11 @@ import os
 from datetime import datetime as dt, timedelta
 from collections import defaultdict
 from dotenv import load_dotenv
-import os
-from keep_alive import keep_alive
-keep_alive()
+
 # ================= CONFIG =================
+
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
-
 
 GUILD_ID = 1475595580066762762
 
@@ -23,6 +21,9 @@ STAFF_UPDATES_CHANNEL_ID = 1475602070479568936
 
 TICKET_PANEL_CHANNEL = 1475615742434218138
 TICKET_CATEGORY_ID = 1475601312644206793
+
+PARTY_CHANNEL_ID = 1476193789826564167      # where /party message is sent
+PARTY_CATEGORY_ID = 1476193789826564167     # where private party channels are created
 
 DUEL_REQUEST_CHANNEL_ID = 1475806613532180500
 DUEL_CATEGORY_ID = TICKET_CATEGORY_ID
@@ -38,9 +39,9 @@ STAFF_ROLE_IDS = [
 ]
 
 APPLICATION_PING_ROLE_IDS = [
-    1475595775328391269,   # Admin
-    1475598374874120374,   # Manager
-    1475923450798543029    # Owner
+    1475595775328391269,
+    1475598374874120374,
+    1475923450798543029
 ]
 
 SELF_ROLE_IDS = [
@@ -64,6 +65,10 @@ guild_obj = discord.Object(id=GUILD_ID)
 
 duel_voice_last_active = defaultdict(float)
 
+# ================= PARTY SYSTEM STORAGE =================
+active_parties = {}          # msg.id → party data
+user_party_membership = {}   # user_id → msg_id of the party they're in
+
 # ================= UTIL =================
 
 async def send_log(guild, message):
@@ -76,6 +81,131 @@ def is_staff(member: discord.Member):
 
 def is_owner(user_id):
     return user_id == OWNER_ID
+
+# ================= PARTY JOIN/LEAVE VIEW =================
+
+class PartyJoinView(discord.ui.View):
+    def __init__(self, leader: discord.Member, msg_id: int = None):
+        super().__init__(timeout=None)
+        self.leader = leader
+        self.members = [leader]
+        self.msg_id = msg_id
+
+    @discord.ui.button(label="Join", style=discord.ButtonStyle.green, custom_id="party_join")
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user = interaction.user
+
+        # Already in some party?
+        if user.id in user_party_membership:
+            await interaction.response.send_message("You're already in a party! Leave your current one first.", ephemeral=True)
+            return
+
+        if user in self.members:
+            await interaction.response.send_message("You're already in this party!", ephemeral=True)
+            return
+
+        if len(self.members) >= 4:
+            await interaction.response.send_message("Party is full (4/4)!", ephemeral=True)
+            return
+
+        self.members.append(user)
+        user_party_membership[user.id] = self.msg_id
+
+        embed = interaction.message.embeds[0]
+        embed.description = f"{self.leader.mention} created a party!\n**{len(self.members)}/4** — {4 - len(self.members)} players left."
+        await interaction.message.edit(embed=embed)
+
+        await interaction.response.send_message(f"{user.mention} has joined the party!", ephemeral=False)
+
+        if len(self.members) == 4:
+            await self.create_party_channel(interaction)
+
+    @discord.ui.button(label="Leave", style=discord.ButtonStyle.grey, custom_id="party_leave")
+    async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user = interaction.user
+
+        if user not in self.members:
+            await interaction.response.send_message("You're not in this party!", ephemeral=True)
+            return
+
+        if user == self.leader:
+            await interaction.response.send_message("The party leader cannot leave. Use Disband in the party channel instead.", ephemeral=True)
+            return
+
+        self.members.remove(user)
+        if user.id in user_party_membership:
+            del user_party_membership[user.id]
+
+        embed = interaction.message.embeds[0]
+        embed.description = f"{self.leader.mention} created a party!\n**{len(self.members)}/4** — {4 - len(self.members)} players left."
+        await interaction.message.edit(embed=embed)
+
+        await interaction.response.send_message(f"{user.mention} has left the party.", ephemeral=False)
+
+    async def create_party_channel(self, interaction):
+        category = bot.get_channel(PARTY_CATEGORY_ID)
+        if not category:
+            return
+
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            bot.user: discord.PermissionOverwrite(view_channel=True, send_messages=True)
+        }
+
+        for member in self.members:
+            overwrites[member] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
+
+        party_channel = await interaction.guild.create_text_channel(
+            name=f"party-{self.leader.name}",
+            category=category,
+            overwrites=overwrites,
+            reason=f"Party created by {self.leader}"
+        )
+
+        disband_view = PartyDisbandView(self.leader, party_channel)
+
+        embed = discord.Embed(
+            title="Party Channel Created",
+            description="This is your party channel. Enjoy!",
+            color=discord.Color.green(),
+            timestamp=dt.utcnow()
+        )
+
+        ping_mentions = " ".join([m.mention for m in self.members])
+        await party_channel.send(embed=embed, content=ping_mentions, view=disband_view)
+
+
+# ================= PARTY DISBAND VIEW =================
+
+class PartyDisbandView(discord.ui.View):
+    def __init__(self, leader: discord.Member, channel: discord.TextChannel):
+        super().__init__(timeout=None)
+        self.leader = leader
+        self.channel = channel
+
+    @discord.ui.button(label="Disband", style=discord.ButtonStyle.red, custom_id="party_disband")
+    async def disband(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.leader:
+            await interaction.response.send_message("Only the party leader can disband the party.", ephemeral=True)
+            return
+
+        # Clean up membership tracking
+        for member in self.members:
+            if member.id in user_party_membership:
+                del user_party_membership[member.id]
+
+        await interaction.response.send_message(f"{self.leader.mention} has disbanded the party. Disbanding...", ephemeral=False)
+        await asyncio.sleep(2)
+
+        try:
+            await self.channel.delete(reason="Party disbanded by leader")
+        except:
+            pass
+
 
 # ================= TICKET VIEWS =================
 
@@ -232,10 +362,6 @@ class DuelAcceptView(discord.ui.View):
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.green, custom_id="duel_accept")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # No DB check anymore — just accept and create channels
-        # (you can add manual duplicate check logic later if needed)
-
-        # Fake duel number (simple counter in memory - resets on restart)
         duel_num = len(duel_voice_last_active) + 1
 
         category = interaction.guild.get_channel(DUEL_CATEGORY_ID)
@@ -288,7 +414,6 @@ async def check_inactive_duels():
         inactive_time = now - last_active
 
         if inactive_time >= DUEL_INACTIVITY_TIMEOUT_MIN * 60 and last_active > 0:
-            # Find text channel by name pattern (since no DB)
             for ch in voice_ch.category.channels:
                 if isinstance(ch, discord.TextChannel) and ch.name == voice_ch.name:
                     text_ch = ch
@@ -355,13 +480,97 @@ async def on_message(message):
         return
 
     if is_staff(message.author):
-        # No DB tracking anymore — you can add print or log if you want
         pass
 
     await bot.process_commands(message)
 
 
 # ================= SLASH COMMANDS =================
+
+@app_commands.command(name="party", description="Create a new party (max 4 players)")
+async def party(interaction: discord.Interaction):
+    party_channel = bot.get_channel(PARTY_CHANNEL_ID)
+    if not party_channel:
+        await interaction.response.send_message("Party announcement channel not found.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🎉 New Party Created!",
+        description=f"{interaction.user.mention} created a party!\n**1/4** — 3 players left.",
+        color=discord.Color.gold(),
+        timestamp=dt.utcnow()
+    )
+    embed.set_footer(text="Click Join to participate!")
+
+    view = PartyJoinView(interaction.user, msg_id=None)
+
+    msg = await party_channel.send("@everyone", embed=embed, view=view)
+
+    # Update view with real message id
+    view.msg_id = msg.id
+
+    async def party_timeout():
+        await asyncio.sleep(30)
+
+        if msg.id not in active_parties:
+            return
+
+        party_data = active_parties[msg.id]
+        members = party_data['members']
+        leader = party_data['leader']
+
+        if len(members) < 4:
+            category = bot.get_channel(PARTY_CATEGORY_ID)
+            if not category:
+                await msg.reply("Error: Party category not found.", delete_after=10)
+                if msg.id in active_parties:
+                    del active_parties[msg.id]
+                return
+
+            overwrites = {
+                interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                bot.user: discord.PermissionOverwrite(view_channel=True, send_messages=True)
+            }
+
+            for member in members:
+                overwrites[member] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True
+                )
+
+            party_channel = await interaction.guild.create_text_channel(
+                name=f"party-{leader.name}",
+                category=category,
+                overwrites=overwrites,
+                reason=f"Party created by {leader}"
+            )
+
+            disband_view = PartyDisbandView(leader, party_channel)
+
+            embed = discord.Embed(
+                title="Party Channel Created",
+                description="This is your party channel. Enjoy!",
+                color=discord.Color.green(),
+                timestamp=dt.utcnow()
+            )
+
+            ping_mentions = " ".join([m.mention for m in members])
+            await party_channel.send(embed=embed, content=ping_mentions, view=disband_view)
+
+        if msg.id in active_parties:
+            del active_parties[msg.id]
+
+    timer_task = asyncio.create_task(party_timeout())
+    active_parties[msg.id] = {
+        'leader': interaction.user,
+        'members': view.members,
+        'view': view,
+        'timer': timer_task
+    }
+
+    await interaction.response.send_message("Party created! Check <#1476193789826564167>.", ephemeral=True)
+
 
 @app_commands.command(name="duel", description="Request a duel against players with a specific role")
 @app_commands.describe(role="Choose the role you want to duel against")
@@ -552,6 +761,7 @@ async def staffstats(interaction: discord.Interaction):
 
 # ================= REGISTER ALL COMMANDS =================
 
+bot.tree.add_command(party, guild=guild_obj)
 bot.tree.add_command(duel, guild=guild_obj)
 bot.tree.add_command(staff_cmd, guild=guild_obj)
 bot.tree.add_command(pgamemode, guild=guild_obj)
@@ -563,6 +773,5 @@ bot.tree.add_command(tempban, guild=guild_obj)
 bot.tree.add_command(staffstats, guild=guild_obj)
 
 # ==========================================
-
 
 bot.run(TOKEN)
